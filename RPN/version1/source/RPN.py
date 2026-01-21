@@ -1,11 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.ops import nms
 class RPN(nn.Module):
-    def __init__(self, in_channels=512, out_channels=512, n_anchors=9, scales = [8,16,32], aspect_ratio = [0.5, 1, 2]):
+    def __init__(self, in_channels=512, out_channels=512, n_anchors=9, scales = [8,16,32], aspect_ratios = [0.5, 1, 2]):
         super().__init__()
         self.scales = scales
-        self.aspect_ratio = aspect_ratio
+        self.aspect_ratios = aspect_ratios
         self.conv1 = nn.Conv2d(in_channels, out_channels,kernel_size= 3,stride= 1, padding =1)
         
         self.cls_score = nn.Conv2d(out_channels, n_anchors * 2,kernel_size= 1,stride= 1, padding=0)
@@ -13,10 +14,20 @@ class RPN(nn.Module):
         self.bbox_pred = nn.Conv2d(out_channels, n_anchors * 4, 1, 1, 0)
 
     def forward(self, x):
+        # 1. Przechodzimy przez konwolucje
         x = F.relu(self.conv1(x))
-        rpn_cls_score = self.cls_score(x)
-        rpn_bbox_pred = self.bbox_pred(x)
-        return rpn_cls_score, rpn_bbox_pred
+        
+        # [Batch, n_anchors * 2, H, W] -> [Batch, H, W, n_anchors * 2]
+        cls_logits = self.cls_score(x).permute(0, 2, 3, 1).contiguous()
+        # [Batch * H * W * n_anchors, 2]
+        cls_logits = cls_logits.view(-1, 2)
+        
+        # [Batch, n_anchors * 4, H, W] -> [Batch, H, W, n_anchors * 4]
+        bbox_regs = self.bbox_pred(x).permute(0, 2, 3, 1).contiguous()
+        # [Batch * H * W * n_anchors, 4]
+        bbox_regs = bbox_regs.view(-1, 4)
+        
+        return cls_logits, bbox_regs
     
     def generate_anchors(self, image, feat):
             r"""
@@ -86,13 +97,16 @@ class RPN(nn.Module):
             # anchors -> (H_feat * W_feat, num_anchors_per_location, 4)
             anchors = anchors.reshape(-1, 4)
             # anchors -> (H_feat * W_feat * num_anchors_per_location, 4)
-            return anchors
-    def box_iou(anchors, boxes):
+            #return anchors
+            return anchors.to(feat.device)
+
+    def box_iou(self,anchors, boxes):
         """
         anchors: (N, 4) - wygenerowane kotwice
         boxes: (M, 4) - prawdziwe ramki (Ground Truth)
         Zwraca: (N, M) macierz IoU
         """
+        boxes = boxes.to(anchors.device)
 
         # 1. Obliczamy powierzchnię obu zestawów ramek
         # Area = (x2 - x1) * (y2 - y1)
@@ -115,27 +129,48 @@ class RPN(nn.Module):
         union = area_anchors[:, None] + area_boxes - inter
 
         return inter / union
-    def assign_labels(anchors, gt_boxes, iou_matrix):
-        # Domyślnie wszystkie kotwice to -1 (ignoruj)
-        labels = torch.full((anchors.size(0),), -1, dtype=torch.int64)
+    def assign_labels(self, anchors, gt_boxes, iou_matrix):
+        device = anchors.device
 
-        # Dla każdej kotwicy znajdź obiekt, z którym ma najwyższe IoU
+        labels = torch.full(
+            (anchors.size(0),),
+            -1,
+            dtype=torch.int64,
+            device=device
+        )
+
         max_iou_per_anchor, argmax_iou_per_anchor = iou_matrix.max(dim=1)
 
-        # 1. Kotwice z niskim IoU to tło (0)
         labels[max_iou_per_anchor < 0.3] = 0
-
-        # 2. Kotwice z wysokim IoU to obiekt (1)
         labels[max_iou_per_anchor >= 0.7] = 1
 
-        # 3. Specjalny przypadek: Zawsze daj 1 kotwicy, która ma 
-        # absolutnie najwyższe IoU dla danego obiektu (nawet jeśli < 0.7)
         max_iou_per_gt, _ = iou_matrix.max(dim=0)
         for i in range(len(max_iou_per_gt)):
             labels[iou_matrix[:, i] == max_iou_per_gt[i]] = 1
 
         return labels
-    def encode_boxes(anchors, gt_boxes):
+
+    #def assign_labels(self,anchors, gt_boxes, iou_matrix):
+    #    # Domyślnie wszystkie kotwice to -1 (ignoruj)
+    #    labels = torch.full((anchors.size(0),), -1, dtype=torch.int64)
+#
+    #    # Dla każdej kotwicy znajdź obiekt, z którym ma najwyższe IoU
+    #    max_iou_per_anchor, argmax_iou_per_anchor = iou_matrix.max(dim=1)
+#
+    #    # 1. Kotwice z niskim IoU to tło (0)
+    #    labels[max_iou_per_anchor < 0.3] = 0
+#
+    #    # 2. Kotwice z wysokim IoU to obiekt (1)
+    #    labels[max_iou_per_anchor >= 0.7] = 1
+#
+    #    # 3. Specjalny przypadek: Zawsze daj 1 kotwicy, która ma 
+    #    # absolutnie najwyższe IoU dla danego obiektu (nawet jeśli < 0.7)
+    #    max_iou_per_gt, _ = iou_matrix.max(dim=0)
+    #    for i in range(len(max_iou_per_gt)):
+    #        labels[iou_matrix[:, i] == max_iou_per_gt[i]] = 1
+#
+    #    return labels
+    def encode_boxes(self,anchors, gt_boxes):
         """
         anchors: [N, 4] (x1, y1, x2, y2)
         gt_boxes: [N, 4] (x1, y1, x2, y2) - przypisane obiekty dla każdej kotwicy
@@ -159,7 +194,7 @@ class RPN(nn.Module):
 
         deltas = torch.stack([dx, dy, dw, dh], dim=1)
         return deltas
-    def decode_boxes(anchors, deltas):
+    def decode_boxes(self, anchors, deltas):
         """
         anchors: [N, 4]
         deltas: [N, 4] (wynik z sieci RPN)
@@ -186,23 +221,24 @@ class RPN(nn.Module):
         return torch.stack([x1, y1, x2, y2], dim=1)
     import torch.nn.functional as F
 
-    def rpn_loss(pred_cls_scores, pred_deltas, labels, target_deltas):
+    def rpn_loss(self,pred_cls_scores, pred_deltas, labels, target_deltas):
         """
         pred_cls_scores: [N, 2] - wyniki klasyfikacji z RPN (obiekt vs tło)
         pred_deltas: [N, 4] - przewidziane przez sieć poprawki
         labels: [N] - prawdziwe etykiety z funkcji assign_labels (1, 0, -1)
         target_deltas: [N, 4] - prawdziwe poprawki z funkcji encode_boxes
         """
-        
         # 1. Filtrujemy tylko te kotwice, które nie są ignorowane (labels != -1)
         # Ignorujemy kotwice z etykietą -1, żeby nie psuły gradientu
         keep_idx = torch.where(labels != -1)[0]
-        
+        #print("pred_cls_scores:", pred_cls_scores[keep_idx].shape)
+        #print("labels:", labels[keep_idx].shape)
+
         cls_loss = F.cross_entropy(pred_cls_scores[keep_idx], labels[keep_idx])
-    
+
         # 2. Strata regresji (tylko dla kotwic, które są obiektami: labels == 1)
         pos_idx = torch.where(labels == 1)[0]
-        
+
         if len(pos_idx) > 0:
             # Smooth L1 liczymy tylko tam, gdzie faktycznie jest obiekt
             reg_loss = F.smooth_l1_loss(
@@ -215,7 +251,49 @@ class RPN(nn.Module):
             reg_loss = reg_loss / (labels == 1).sum()
         else:
             reg_loss = torch.tensor(0.0).to(pred_deltas.device)
-    
+
         # Całkowita strata
         total_loss = cls_loss + reg_loss
         return total_loss, cls_loss, reg_loss
+    
+    from torchvision.ops import nms
+
+    def get_proposals(self, cls_logits, bbox_deltas, anchors, image_size):
+        H, W = image_size
+        device = cls_logits.device
+        anchors = anchors.to(device)
+        bbox_deltas = bbox_deltas.to(device)
+
+        # 1. Decode anchors → proposals
+        proposals = self.decode_boxes(anchors, bbox_deltas)
+    
+        # 2. Clip to image boundaries
+        proposals[:, 0].clamp_(0, W)
+        proposals[:, 2].clamp_(0, W)
+        proposals[:, 1].clamp_(0, H)
+        proposals[:, 3].clamp_(0, H)
+    
+        # 3. Scores = probability of "object"
+        scores = cls_logits.softmax(dim=1)[:, 1]
+    
+        # 4. Remove invalid boxes (x2 > x1, y2 > y1)
+        keep = (proposals[:, 2] > proposals[:, 0]) & (proposals[:, 3] > proposals[:, 1])
+        proposals = proposals[keep]
+        scores = scores[keep]
+    
+        # 5. Remove very small boxes
+        min_size = 4
+        ws = proposals[:, 2] - proposals[:, 0]
+        hs = proposals[:, 3] - proposals[:, 1]
+        keep = (ws >= min_size) & (hs >= min_size)
+        proposals = proposals[keep]
+        scores = scores[keep]
+    
+        # 6. NMS
+        keep_idx = nms(proposals, scores, iou_threshold=0.7)
+        keep_idx = keep_idx[:2000]
+    
+        proposals = proposals[keep_idx]
+        scores = scores[keep_idx]
+    
+        return proposals, scores
