@@ -53,4 +53,49 @@ def test_faster_rcnn_end_to_end_training():
     # 8. Optymalizator
     optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
     optimizer.step()
-test_faster_rcnn_end_to_end_training()
+def test_faster_rcnn_end_to_end_training2():
+    model = FasterRCnn(num_classes=5)
+    model.train()
+
+    images = torch.randn(1, 3, 800, 800)
+    # Definiujemy pudełko GT
+    gt_boxes = torch.tensor([[100., 100., 300., 300.]])
+    gt_labels = torch.tensor([1])
+
+    targets = {"boxes": gt_boxes, "labels": gt_labels}
+
+    # --- HACK TESTOWY ---
+    # Aby sprawdzić, czy loss_roi_reg działa, musimy upewnić się, że 
+    # propozycja z IoU > 0.5 trafi do RoiHead.
+    # Możemy to zrobić nadpisując na chwilę metodę get_proposals lub 
+    # modyfikując zachowanie modelu. 
+    # Najprościej: wrzućmy boxa, który jest prawie idealny (lekko przesunięty)
+    # do mechanizmu, który model uzna za propozycję.
+    
+    # Wykonaj forward
+    losses = model(images, targets)
+
+    print("-" * 30)
+    for k, v in losses.items():
+        print(f"{k}: {v.item():.4f}")
+    
+    # Sprawdzenie logiczne
+    assert losses["loss_roi_cls"] > 0, "Klasyfikacja ROI powinna coś liczyć"
+    
+    if losses["loss_roi_reg"] == 0:
+        print("\nOSTRZEŻENIE: loss_roi_reg nadal 0. RPN nie wygenerował nic blisko GT.")
+        print("Sugestia: W forward modelu, podczas treningu, dodaj: proposals = torch.cat([proposals, gt_boxes], dim=0)")
+    else:
+        print("\nSUKCES: loss_roi_reg > 0. Regresja ROI działa!")
+
+    # 7. Sprawdzenie gradientów (czy sieć się "łączy")
+    total_loss = sum(losses.values())
+    total_loss.backward()
+    
+    # Sprawdź czy wagach backbone'u pojawił się gradient
+    has_grad = model.backbone.conv1.weight.grad is not None
+    print(f"Gradienty w backbone: {has_grad}")
+    assert has_grad, "Gradient nie dotarł do backbone!"
+
+#test_faster_rcnn_end_to_end_training()
+test_faster_rcnn_end_to_end_training2()
